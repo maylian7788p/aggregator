@@ -60,6 +60,7 @@ jobs:
         run: |
           python3 - <<'PYEOF'
           import json, base64, urllib.request, os, re, sys, datetime
+          import yaml
           log = open("/tmp/process.log", encoding="utf-8", errors="replace").read()
           clash_ok = "[PushSuccess] push subscribes information to gist successed, group=[free::clash]" in log
           m = re.search(r"group \[free\] process finished, count: (\d+)", log)
@@ -87,32 +88,34 @@ jobs:
               sys.exit(0)
           raw = "https://gist.githubusercontent.com/%s/%s/raw/%s" % (clash_st["username"], clash_st["gist_id"], clash_st["filename"])
           text = urllib.request.urlopen(raw).read().decode()
+          doc = yaml.safe_load(text)
+          proxies = doc.get("proxies") or []
+          def ss_link(p):
+              ui = base64.b64encode((p["cipher"] + ":" + str(p["password"])).encode()).decode()
+              return "ss://%s@%s:%s#%s" % (ui, p["server"], p["port"], p["name"])
+          def vmess_link(p):
+              ws = p.get("ws-opts") or {}
+              obj = {"v": "2", "ps": p["name"], "add": p["server"], "port": str(p["port"]),
+                     "id": p["uuid"], "aid": str(p.get("alterId", 0)), "scy": p.get("cipher", "auto"),
+                     "net": p.get("network", "tcp"), "type": "none", "host": (ws.get("headers") or {}).get("Host", ""),
+                     "path": ws.get("path", ""), "tls": "tls" if p.get("tls") else ""}
+              return "vmess://" + base64.b64encode(json.dumps(obj, ensure_ascii=False).encode()).decode()
           links = []
-          in_proxies = False
-          for line in text.splitlines():
-              if line.startswith("proxies:"):
-                  in_proxies = True
-                  continue
-              if not in_proxies:
-                  continue
-              s = line.strip()
-              if not s.startswith("- {"):
-                  break
-              parts = {}
-              for kv in s[2:].strip().strip("{}").split(", "):
-                  if ": " in kv:
-                      k, v = kv.split(": ", 1)
-                      parts[k.strip()] = v.strip()
-              if parts.get("type") == "ss":
-                  userinfo = base64.b64encode((parts["cipher"] + ":" + parts["password"]).encode()).decode()
-                  links.append("ss://%s@%s:%s#%s" % (userinfo, parts["server"], parts["port"], parts["name"]))
-          status = {"checked_at": checked_at, "fresh": True, "valid_nodes": count, "ss_links": len(links)}
+          by_type = {}
+          for p in proxies:
+              t = p.get("type")
+              by_type[t] = by_type.get(t, 0) + 1
+              if t == "ss":
+                  links.append(ss_link(p))
+              elif t == "vmess":
+                  links.append(vmess_link(p))
+          status = {"checked_at": checked_at, "fresh": True, "valid_nodes": count, "sub_links": len(links), "by_type": by_type}
           files = {"status.json": {"content": json.dumps(status)}}
           if links:
               content = base64.b64encode("\n".join(links).encode()).decode()
               files[v2ray_st["filename"]] = {"content": content}
           patch(files)
-          print("FRESH: clash push succeeded this run; checked_at:", checked_at, "valid_nodes:", count, "ss_links:", len(links))
+          print("FRESH: clash push succeeded this run; checked_at:", checked_at, "valid_nodes:", count, "sub_links:", len(links), "by_type:", by_type)
           PYEOF
 
       - name: Timestamp
