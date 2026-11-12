@@ -57,16 +57,30 @@ jobs:
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
           python3 - <<'PYEOF'
-          import json, base64, urllib.request, os
+          import json, base64, urllib.request, os, sys
+          token = os.environ["PUSH_TOKEN"]
           conf = json.load(urllib.request.urlopen(os.environ["SUBSCRIBE_CONF"]))
           items = conf["storage"]["items"]
-          clash_st = items["sub-clash"]
           v2ray_st = items["sub-v2ray"]
-          raw = "https://gist.githubusercontent.com/%s/%s/raw/%s" % (clash_st["username"], clash_st["gist_id"], clash_st["filename"])
-          text = urllib.request.urlopen(raw).read().decode()
+          gid = v2ray_st["gist_id"]
+          hdrs = {"Authorization": "token " + token, "Accept": "application/vnd.github+json"}
+          meta = json.load(urllib.request.urlopen(urllib.request.Request("https://api.github.com/gists/" + gid, headers=hdrs)))
+          hist = meta.get("history", [])
+          if len(hist) < 2:
+              print("STALE-CHECK-SKIP: no prior gist revision to compare")
+              sys.exit(0)
+          v_new, v_old = hist[0]["version"], hist[1]["version"]
+          base = "https://gist.githubusercontent.com/%s/%s/raw" % (v2ray_st["username"], gid)
+          def fetch(v):
+              return urllib.request.urlopen("%s/%s/clash.yaml" % (base, v)).read().decode()
+          new_text = fetch(v_new)
+          old_text = fetch(v_old)
+          if new_text == old_text:
+              print("STALE: clash.yaml unchanged this run (zero fresh nodes or push failed); leaving v2ray.txt unchanged")
+              sys.exit(0)
           links = []
           in_proxies = False
-          for line in text.splitlines():
+          for line in new_text.splitlines():
               if line.startswith("proxies:"):
                   in_proxies = True
                   continue
@@ -84,14 +98,14 @@ jobs:
                   userinfo = base64.b64encode((parts["cipher"] + ":" + parts["password"]).encode()).decode()
                   links.append("ss://%s@%s:%s#%s" % (userinfo, parts["server"], parts["port"], parts["name"]))
           if not links:
-              print("no ss nodes found; leaving v2ray.txt unchanged")
-              raise SystemExit(0)
+              print("STALE-SKIP: fresh clash.yaml has no ss nodes; leaving v2ray.txt unchanged")
+              sys.exit(0)
           content = base64.b64encode("\n".join(links).encode()).decode()
           req = urllib.request.Request(
-              "https://api.github.com/gists/" + v2ray_st["gist_id"],
+              "https://api.github.com/gists/" + gid,
               data=json.dumps({"files": {v2ray_st["filename"]: {"content": content}}}).encode(),
               method="PATCH",
-              headers={"Authorization": "token " + os.environ["PUSH_TOKEN"], "Accept": "application/vnd.github+json"},
+              headers=hdrs,
           )
           resp = urllib.request.urlopen(req)
           print("v2ray.txt updated:", resp.status, "nodes:", len(links))
