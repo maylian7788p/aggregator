@@ -49,7 +49,9 @@ jobs:
         run: pip3 install -r requirements.txt
 
       - name: Process
-        run: python -u subscribe/process.py --overwrite
+        run: |
+          set -o pipefail
+          python -u subscribe/process.py --overwrite 2>&1 | tee /tmp/process.log
 
       - name: Generate v2ray subscription
         env:
@@ -57,30 +59,37 @@ jobs:
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
           python3 - <<'PYEOF'
-          import json, base64, urllib.request, os, sys
+          import json, base64, urllib.request, os, re, sys, datetime
+          log = open("/tmp/process.log", encoding="utf-8", errors="replace").read()
+          clash_ok = "[PushSuccess] push subscribes information to gist successed, group=[free::clash]" in log
+          m = re.search(r"group \[free\] process finished, count: (\d+)", log)
+          count = int(m.group(1)) if m else -1
+          checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
           token = os.environ["PUSH_TOKEN"]
           conf = json.load(urllib.request.urlopen(os.environ["SUBSCRIBE_CONF"]))
           items = conf["storage"]["items"]
           v2ray_st = items["sub-v2ray"]
+          clash_st = items["sub-clash"]
           gid = v2ray_st["gist_id"]
           hdrs = {"Authorization": "token " + token, "Accept": "application/vnd.github+json"}
-          meta = json.load(urllib.request.urlopen(urllib.request.Request("https://api.github.com/gists/" + gid, headers=hdrs)))
-          hist = meta.get("history", [])
-          if len(hist) < 2:
-              print("STALE-CHECK-SKIP: no prior gist revision to compare")
+          def patch(files):
+              req = urllib.request.Request(
+                  "https://api.github.com/gists/" + gid,
+                  data=json.dumps({"files": files}).encode(),
+                  method="PATCH",
+                  headers=hdrs,
+              )
+              return urllib.request.urlopen(req).status
+          if not clash_ok:
+              print("STALE: no successful clash push this run (collection failed or zero valid nodes); previous subscription output retained as stale fallback")
+              status = {"checked_at": checked_at, "fresh": False, "valid_nodes": max(count, 0), "note": "collection or push failed this run; retained previous output"}
+              patch({"status.json": {"content": json.dumps(status)}})
               sys.exit(0)
-          v_new, v_old = hist[0]["version"], hist[1]["version"]
-          base = "https://gist.githubusercontent.com/%s/%s/raw" % (v2ray_st["username"], gid)
-          def fetch(v):
-              return urllib.request.urlopen("%s/%s/clash.yaml" % (base, v)).read().decode()
-          new_text = fetch(v_new)
-          old_text = fetch(v_old)
-          if new_text == old_text:
-              print("STALE: clash.yaml unchanged this run (zero fresh nodes or push failed); leaving v2ray.txt unchanged")
-              sys.exit(0)
+          raw = "https://gist.githubusercontent.com/%s/%s/raw/%s" % (clash_st["username"], clash_st["gist_id"], clash_st["filename"])
+          text = urllib.request.urlopen(raw).read().decode()
           links = []
           in_proxies = False
-          for line in new_text.splitlines():
+          for line in text.splitlines():
               if line.startswith("proxies:"):
                   in_proxies = True
                   continue
@@ -97,18 +106,13 @@ jobs:
               if parts.get("type") == "ss":
                   userinfo = base64.b64encode((parts["cipher"] + ":" + parts["password"]).encode()).decode()
                   links.append("ss://%s@%s:%s#%s" % (userinfo, parts["server"], parts["port"], parts["name"]))
-          if not links:
-              print("STALE-SKIP: fresh clash.yaml has no ss nodes; leaving v2ray.txt unchanged")
-              sys.exit(0)
-          content = base64.b64encode("\n".join(links).encode()).decode()
-          req = urllib.request.Request(
-              "https://api.github.com/gists/" + gid,
-              data=json.dumps({"files": {v2ray_st["filename"]: {"content": content}}}).encode(),
-              method="PATCH",
-              headers=hdrs,
-          )
-          resp = urllib.request.urlopen(req)
-          print("v2ray.txt updated:", resp.status, "nodes:", len(links))
+          status = {"checked_at": checked_at, "fresh": True, "valid_nodes": count, "ss_links": len(links)}
+          files = {"status.json": {"content": json.dumps(status)}}
+          if links:
+              content = base64.b64encode("\n".join(links).encode()).decode()
+              files[v2ray_st["filename"]] = {"content": content}
+          patch(files)
+          print("FRESH: clash push succeeded this run; checked_at:", checked_at, "valid_nodes:", count, "ss_links:", len(links))
           PYEOF
 
       - name: Timestamp
